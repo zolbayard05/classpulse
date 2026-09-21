@@ -1,0 +1,24 @@
+# Dataset caches / raw images (too large, contain source photos)
+Classpulse-1/
+CombinedDataset/
+review_batch/
+unlabeled_batch/
+runs/
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs / temp artifacts
+*.log
+*.output
+hud_test_preview.jpg
+hud_demo*.jpg
+zoom_check.jpg
+artifact_preview.html
+
+# Roboflow / local bookkeeping (may contain image ids, not secrets, but noisy)
+processed_ids.txt
+id_name_map.txt
+review_priority.json
+sleeping_fix_targets.json
