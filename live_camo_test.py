@@ -31,6 +31,10 @@ FONT = cv2.FONT_HERSHEY_SIMPLEX
 FONT_SCALE = 0.5
 FONT_THICKNESS = 1
 CROSS_CLASS_IOU_THRESH = 0.5   # үүнээс дээш давхцвал зөвхөн хамгийн итгэлтэй class-ыг үлдээнэ
+STANDING_ASPECT_RATIO = 1.4    # box-ийн өндөр/өргөн харьцаа үүнээс дээш бол "зогссон" гэж үзнэ
+SMOOTH_IOU_THRESH = 0.3        # frame хооронд ижил хүн гэж тооцох хамгийн бага IoU
+SMOOTH_ALPHA = 0.3             # EMA smoothing коэффициент (бага байх тусам илүү гөлгөр, удаан хариу үйлдэл)
+SMOOTH_MAX_AGE = 10            # frame-ээр илрээгүй track-ыг хэдэн frame-ийн дараа устгах
 
 
 def iou(a, b):
@@ -63,6 +67,69 @@ def suppress_cross_class_overlaps(dets, iou_thresh=CROSS_CLASS_IOU_THRESH):
         if not suppressed:
             kept.append(d)
     return kept
+
+
+def apply_standing_rule(dets, ratio_thresh=STANDING_ASPECT_RATIO):
+    """Sleeping-ээс бусад хүний box өндөр/нарийн (зогссон/явж буй) бол distracted болгоно.
+    Зөвхөн тухайн хүний ӨӨРИЙН box-ийн хэлбэрт л тулгуурладаг тул хажуугийн хүнээс
+    нөлөөлдөггүй (гинжин false positive үүсгэхгүй)."""
+    out = []
+    for x1, y1, x2, y2, conf, cls_name in dets:
+        w = max(1, x2 - x1)
+        h = max(1, y2 - y1)
+        if cls_name != "sleeping" and (h / w) > ratio_thresh:
+            cls_name = "distracted"
+        out.append((x1, y1, x2, y2, conf, cls_name))
+    return out
+
+
+class ConfidenceSmoother:
+    """Frame хоорондоо box-уудыг IoU-аар тааруулж, confidence-ийг EMA-аар тэгшилнэ.
+    Ингэснээр нэг хүний тоо frame бүрт үсрэлт хийхгүй, гөлгөр өөрчлөгдөнө."""
+
+    def __init__(self, iou_thresh=SMOOTH_IOU_THRESH, alpha=SMOOTH_ALPHA, max_age=SMOOTH_MAX_AGE):
+        self.iou_thresh = iou_thresh
+        self.alpha = alpha
+        self.max_age = max_age
+        self.tracks = []  # {box, cls_name, smoothed_conf, age}
+
+    def update(self, dets):
+        used_tracks = set()
+        out = []
+
+        for x1, y1, x2, y2, conf, cls_name in dets:
+            best_iou, best_i = 0, -1
+            for i, t in enumerate(self.tracks):
+                if i in used_tracks or t["cls_name"] != cls_name:
+                    continue
+                v = iou((x1, y1, x2, y2), t["box"])
+                if v > best_iou:
+                    best_iou, best_i = v, i
+
+            if best_iou > self.iou_thresh:
+                t = self.tracks[best_i]
+                t["smoothed_conf"] = self.alpha * conf + (1 - self.alpha) * t["smoothed_conf"]
+                t["box"] = (x1, y1, x2, y2)
+                t["age"] = 0
+                used_tracks.add(best_i)
+                out.append((x1, y1, x2, y2, t["smoothed_conf"], cls_name))
+            else:
+                new_track = {"box": (x1, y1, x2, y2), "cls_name": cls_name, "smoothed_conf": conf, "age": 0}
+                self.tracks.append(new_track)
+                used_tracks.add(len(self.tracks) - 1)
+                out.append((x1, y1, x2, y2, conf, cls_name))
+
+        # хайгдаагүй track-уудыг хөгшрүүлж, хэт хуучирсныг хасна
+        alive = []
+        for i, t in enumerate(self.tracks):
+            if i not in used_tracks:
+                t["age"] += 1
+                if t["age"] > self.max_age:
+                    continue
+            alive.append(t)
+        self.tracks = alive
+
+        return out
 
 
 def rects_overlap(a, b):
@@ -120,11 +187,12 @@ def main():
     parser.add_argument("--camera", type=int, default=0, help="Camera device index (Camo эсвэл built-in)")
     parser.add_argument("--model", type=str, default="best.pt", help="YOLO model weights path")
     parser.add_argument("--conf", type=float, default=0.35, help="Confidence threshold")
-    parser.add_argument("--hide-conf", action="store_true", help="Label дээр confidence тоо бүү харуул")
+    parser.add_argument("--show-conf", action="store_true", help="Label дээр confidence тоог харуул (анхдагчаар нуугдсан)")
     args = parser.parse_args()
 
     print(f"Loading model: {args.model}")
     model = YOLO(args.model)
+    smoother = ConfidenceSmoother()
 
     print(f"Opening camera index {args.camera} ...")
     cap = cv2.VideoCapture(args.camera)
@@ -153,6 +221,12 @@ def main():
         # нэг хүн дээр өөр class-ийн box давхцвал хамгийн итгэлтэйг нь л үлдээнэ
         raw_dets = suppress_cross_class_overlaps(raw_dets)
 
+        # зогссон/явж буй хүнийг distracted болгоно (sleeping-д хэрэглэхгүй)
+        raw_dets = apply_standing_rule(raw_dets)
+
+        # frame хоорондын confidence-ийг гөлгөр болгоно (тогтворгүй үсрэлтийг арилгана)
+        raw_dets = smoother.update(raw_dets)
+
         # box-уудыг дээрээс доош эрэмбэлж, label collision-ийг тогтвортой болгоно
         raw_dets.sort(key=lambda d: d[1])
 
@@ -165,7 +239,7 @@ def main():
             color = CLASS_COLORS.get(cls_name, (255, 255, 255))
             counts[cls_name] = counts.get(cls_name, 0) + 1
 
-            label = cls_name if args.hide_conf else f"{cls_name} {conf:.2f}"
+            label = f"{cls_name} {conf:.2f}" if args.show_conf else cls_name
             (tw, th), _ = cv2.getTextSize(label, FONT, FONT_SCALE, FONT_THICKNESS)
             lx1, ly1, lx2, ly2 = place_label(label_rects, x1, y1, tw, th, h)
 
