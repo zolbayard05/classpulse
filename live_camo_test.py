@@ -37,6 +37,7 @@ SMOOTH_IOU_THRESH = 0.3        # frame хооронд ижил хүн гэж т�
 SMOOTH_ALPHA = 0.3             # EMA smoothing коэффициент (бага байх тусам илүү гөлгөр, удаан хариу үйлдэл)
 SMOOTH_MAX_AGE = 10            # frame-ээр илрээгүй track-ыг хэдэн frame-ийн дараа устгах
 VOTE_WINDOW = 7                # class-ыг сүүлийн хэдэн frame-ийн дийлэнхээр шийдэх вэ
+QUIET_CLASSES = {"attentive"}  # эдгээр class-д зөвхөн хүрээ зурна, label бичихгүй (олон хүнтэй үед цэвэрхэн харагдуулна)
 
 
 def iou(a, b):
@@ -247,12 +248,17 @@ def main():
 
         counts = {c: 0 for c in CLASS_ORDER}
         label_rects = []
-        drawn = []  # (color, x1,y1,x2,y2, label, lx1,ly1,lx2,ly2)
+        drawn = []       # (color, x1,y1,x2,y2, label_or_None, lx1,ly1,lx2,ly2)
 
         # 1-р эгнээ: геометрийг тооцоолох (юу ч зураагүй)
         for x1, y1, x2, y2, conf, cls_name in raw_dets:
             color = CLASS_COLORS.get(cls_name, (255, 255, 255))
             counts[cls_name] = counts.get(cls_name, 0) + 1
+
+            if cls_name in QUIET_CLASSES:
+                # текст бичихгүй, зөвхөн хүрээ — олон хүнтэй үед цэвэрхэн харагдана
+                drawn.append((color, x1, y1, x2, y2, None, 0, 0, 0, 0))
+                continue
 
             label = f"{cls_name} {conf:.2f}" if args.show_conf else cls_name
             (tw, th), _ = cv2.getTextSize(label, FONT, FONT_SCALE, FONT_THICKNESS)
@@ -260,16 +266,18 @@ def main():
 
             drawn.append((color, x1, y1, x2, y2, label, lx1, ly1, lx2, ly2))
 
-        # 2-р эгнээ: зөвхөн label-ийн арын өнгийг тунгалаг байдлаар blend хийнэ
+        # 2-р эгнээ: зөвхөн label-тэй box-уудын арын өнгийг тунгалаг байдлаар blend хийнэ
         overlay = frame.copy()
         for color, x1, y1, x2, y2, label, lx1, ly1, lx2, ly2 in drawn:
-            cv2.rectangle(overlay, (lx1, ly1), (lx2, ly2), color, -1)
+            if label is not None:
+                cv2.rectangle(overlay, (lx1, ly1), (lx2, ly2), color, -1)
         cv2.addWeighted(overlay, LABEL_ALPHA, frame, 1 - LABEL_ALPHA, 0, frame)
 
-        # 3-р эгнээ: box зураас болон текстийг бүрэн тодоор дээр нь зурна
+        # 3-р эгнээ: box зураас болон (байвал) текстийг бүрэн тодоор дээр нь зурна
         for color, x1, y1, x2, y2, label, lx1, ly1, lx2, ly2 in drawn:
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, BOX_THICKNESS)
-            cv2.putText(frame, label, (lx1 + 4, ly2 - 6), FONT, FONT_SCALE, (0, 0, 0), FONT_THICKNESS, cv2.LINE_AA)
+            if label is not None:
+                cv2.putText(frame, label, (lx1 + 4, ly2 - 6), FONT, FONT_SCALE, (0, 0, 0), FONT_THICKNESS, cv2.LINE_AA)
 
         draw_summary_hud(frame, counts)
 
