@@ -14,6 +14,7 @@ Classpulse - Camo camera дээр real-time тест хийх script (macOS)
 """
 
 import argparse
+import collections
 import cv2
 from ultralytics import YOLO
 
@@ -35,6 +36,7 @@ STANDING_ASPECT_RATIO = 1.4    # box-ийн өндөр/өргөн харьцаа
 SMOOTH_IOU_THRESH = 0.3        # frame хооронд ижил хүн гэж тооцох хамгийн бага IoU
 SMOOTH_ALPHA = 0.3             # EMA smoothing коэффициент (бага байх тусам илүү гөлгөр, удаан хариу үйлдэл)
 SMOOTH_MAX_AGE = 10            # frame-ээр илрээгүй track-ыг хэдэн frame-ийн дараа устгах
+VOTE_WINDOW = 7                # class-ыг сүүлийн хэдэн frame-ийн дийлэнхээр шийдэх вэ
 
 
 def iou(a, b):
@@ -83,24 +85,30 @@ def apply_standing_rule(dets, ratio_thresh=STANDING_ASPECT_RATIO):
     return out
 
 
-class ConfidenceSmoother:
-    """Frame хоорондоо box-уудыг IoU-аар тааруулж, confidence-ийг EMA-аар тэгшилнэ.
-    Ингэснээр нэг хүний тоо frame бүрт үсрэлт хийхгүй, гөлгөр өөрчлөгдөнө."""
+class PersonTracker:
+    """Frame хоорондоо хүн бүрийг IoU-аар дагаж:
+    1) confidence-ийг EMA-аар гөлгөр болгоно
+    2) class-ыг сүүлийн VOTE_WINDOW frame-ийн ДИЙЛЭНХ (majority vote)-ээр шийднэ
+       (нэг frame дээр гарсан class тэр даруй харагдахгүй, тогтвортой болтол хүлээнэ)
+    """
 
-    def __init__(self, iou_thresh=SMOOTH_IOU_THRESH, alpha=SMOOTH_ALPHA, max_age=SMOOTH_MAX_AGE):
+    def __init__(self, iou_thresh=SMOOTH_IOU_THRESH, alpha=SMOOTH_ALPHA,
+                 max_age=SMOOTH_MAX_AGE, vote_window=VOTE_WINDOW):
         self.iou_thresh = iou_thresh
         self.alpha = alpha
         self.max_age = max_age
-        self.tracks = []  # {box, cls_name, smoothed_conf, age}
+        self.vote_window = vote_window
+        self.tracks = []  # {box, class_history: deque, smoothed_conf, age}
 
     def update(self, dets):
         used_tracks = set()
         out = []
 
         for x1, y1, x2, y2, conf, cls_name in dets:
+            # class-аас үл хамааран, зөвхөн байрлалаар (IoU) хамгийн ойрхон track-ыг хайна
             best_iou, best_i = 0, -1
             for i, t in enumerate(self.tracks):
-                if i in used_tracks or t["cls_name"] != cls_name:
+                if i in used_tracks:
                     continue
                 v = iou((x1, y1, x2, y2), t["box"])
                 if v > best_iou:
@@ -108,16 +116,23 @@ class ConfidenceSmoother:
 
             if best_iou > self.iou_thresh:
                 t = self.tracks[best_i]
+                t["class_history"].append(cls_name)
                 t["smoothed_conf"] = self.alpha * conf + (1 - self.alpha) * t["smoothed_conf"]
                 t["box"] = (x1, y1, x2, y2)
                 t["age"] = 0
                 used_tracks.add(best_i)
-                out.append((x1, y1, x2, y2, t["smoothed_conf"], cls_name))
             else:
-                new_track = {"box": (x1, y1, x2, y2), "cls_name": cls_name, "smoothed_conf": conf, "age": 0}
-                self.tracks.append(new_track)
+                t = {
+                    "box": (x1, y1, x2, y2),
+                    "class_history": collections.deque([cls_name], maxlen=self.vote_window),
+                    "smoothed_conf": conf,
+                    "age": 0,
+                }
+                self.tracks.append(t)
                 used_tracks.add(len(self.tracks) - 1)
-                out.append((x1, y1, x2, y2, conf, cls_name))
+
+            voted_class = collections.Counter(t["class_history"]).most_common(1)[0][0]
+            out.append((x1, y1, x2, y2, t["smoothed_conf"], voted_class))
 
         # хайгдаагүй track-уудыг хөгшрүүлж, хэт хуучирсныг хасна
         alive = []
@@ -192,7 +207,7 @@ def main():
 
     print(f"Loading model: {args.model}")
     model = YOLO(args.model)
-    smoother = ConfidenceSmoother()
+    tracker = PersonTracker()
 
     print(f"Opening camera index {args.camera} ...")
     cap = cv2.VideoCapture(args.camera)
@@ -224,8 +239,8 @@ def main():
         # зогссон/явж буй хүнийг distracted болгоно (sleeping-д хэрэглэхгүй)
         raw_dets = apply_standing_rule(raw_dets)
 
-        # frame хоорондын confidence-ийг гөлгөр болгоно (тогтворгүй үсрэлтийг арилгана)
-        raw_dets = smoother.update(raw_dets)
+        # frame хоорондын confidence-ийг гөлгөр болгож, class-ыг дийлэнх frame-ээр шийднэ
+        raw_dets = tracker.update(raw_dets)
 
         # box-уудыг дээрээс доош эрэмбэлж, label collision-ийг тогтвортой болгоно
         raw_dets.sort(key=lambda d: d[1])
